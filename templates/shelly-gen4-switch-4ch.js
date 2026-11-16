@@ -1,9 +1,11 @@
-// @inputs 3
+// @inputs 5
 // @params 3
-// @outputs 13
+// @outputs 21
 // @input1 relay1: bool = false
 // @input2 relay2: bool = false
-// @input3 refresh: bool = false
+// @input3 relay3: bool = false
+// @input4 relay4: bool = false
+// @input5 refresh: bool = false
 // @param1 host: string = "192.168.1.50"
 // @param2 password: string = ""
 // @param3 pollInterval: timespan = 10s
@@ -16,41 +18,49 @@
 // @output7 power2: number
 // @output8 current2: number
 // @output9 energy2: number
-// @output10 voltage: number
-// @output11 temperature: number
-// @output12 rssi: number
-// @output13 errors: string
+// @output10 on3: bool
+// @output11 power3: number
+// @output12 current3: number
+// @output13 energy3: number
+// @output14 on4: bool
+// @output15 power4: number
+// @output16 current4: number
+// @output17 energy4: number
+// @output18 voltage: number
+// @output19 temperature: number
+// @output20 rssi: number
+// @output21 errors: string
 //
-// Shelly 2PM Gen4 (Profil "switch") über die lokale RPC-API steuern und abfragen.
+// Shelly Gen4 mit 4 Schaltkanalen (Komponenten switch:0, switch:1, switch:2, switch:3).
 //
 // Eingänge:
-//   relay1, relay2  Schaltet Kanal 1 bzw. 2 (true = ein, false = aus).
-//   refresh         Jeder Wert fragt den Status sofort ab.
+//   relay1, relay2, relay3, relay4  true = ein, false = aus.
+//   refresh  Jeder Wert fragt den Status sofort ab.
 // Parameter:
-//   host            IP-Adresse oder Name des Shelly.
-//   password        Passwort des Shelly (Benutzer "admin"); leer, wenn kein Passwort gesetzt ist.
-//   pollInterval    Abfrage-Intervall (mindestens 1 s).
-// Ausgänge (werden nur bei Änderung gesendet):
-//   online          false, wenn der Shelly nicht antwortet.
-//   on1/on2         Schaltzustand der Kanäle.
-//   power1/power2   Wirkleistung in W.
-//   current1/2      Strom in A.
-//   energy1/2       Zählerstand in kWh (seit Werksreset bzw. Zählerreset des Shelly).
-//   voltage         Netzspannung in V.
-//   temperature     Gerätetemperatur in °C.
-//   rssi            WLAN-Signalstärke in dBm.
-//   errors          Fehler des Shelly, z. B. "overtemp, overpower"; leer, wenn keine.
+//   host          IP-Adresse oder Name des Shelly.
+//   password      Passwort des Shelly (Benutzer "admin"); leer, wenn keins gesetzt ist.
+//   pollInterval  Abfrage-Intervall (mindestens 1 s).
+// Ausgänge (nur bei Änderung):
+//   online        false, wenn der Shelly nicht antwortet.
+//   onN           Schaltzustand des Kanals N.
+//   powerN        Wirkleistung in W.        } Bleiben leer bei Geräten
+//   currentN      Strom in A.               } ohne Leistungsmessung
+//   energyN       Zählerstand in kWh.       } (z. B. Shelly 1 Gen4).
+//   voltage       Netzspannung in V.
+//   temperature   Gerätetemperatur in °C.
+//   rssi          WLAN-Signalstärke in dBm.
+//   errors        Fehler des Shelly, z. B. "overtemp"; leer, wenn keine.
 //
 // Optional: Mit einem Webhook-Pfad (Parameter im GPA) löst jeder Aufruf eine sofortige
 // Abfrage aus. Im Shelly unter "Actions" bei "Output on/off" die URL
 // http://<X1-Adresse>:61234/<pfad> eintragen, dann kommen Änderungen ohne Wartezeit an.
 
-const TIMEOUT_S = 3;                        // knapp halten: Die Logik wartet auf die Antwort.
-const POLL_MS = Math.max(1000, pollInterval);
+// ---------------------------------------------------------------------------
+// Gemeinsamer Teil: RPC über HTTP mit optionaler Digest-Authentifizierung
+// (SHA-256, Benutzer "admin"), Runden, nur Änderungen senden.
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// RPC mit optionaler Digest-Authentifizierung (SHA-256, Benutzer "admin")
-// ---------------------------------------------------------------------------
+const TIMEOUT_S = 3;                        // knapp halten: Die Logik wartet auf die Antwort.
 
 function parseChallenge(header) {
   const challenge = {};
@@ -106,41 +116,23 @@ async function rpc(method, params = {}) {
   return data.result;
 }
 
-// ---------------------------------------------------------------------------
-// Status auswerten
-// ---------------------------------------------------------------------------
-
 function round(value, digits) {
-  if (typeof value !== 'number') return undefined;
+  if (!Number.isFinite(value)) return undefined;
   const f = 10 ** digits;
   return Math.round(value * f) / f;
 }
 
-function mapStatus(status) {
-  const ch0 = status['switch:0'];
-  const ch1 = status['switch:1'];
-  if (!ch0 || !ch1) {
-    throw new Error('Keine Kanäle switch:0/switch:1 – ist der Shelly im Rollladen-Profil (cover)?');
-  }
-  const errors = [...(ch0.errors ?? []).map(e => `K1: ${e}`), ...(ch1.errors ?? []).map(e => `K2: ${e}`)];
-  return {
-    online: true,
-    on1: ch0.output,
-    power1: round(ch0.apower, 1),
-    current1: round(ch0.current, 2),
-    energy1: round((ch0.aenergy?.total ?? NaN) / 1000, 3),
-    on2: ch1.output,
-    power2: round(ch1.apower, 1),
-    current2: round(ch1.current, 2),
-    energy2: round((ch1.aenergy?.total ?? NaN) / 1000, 3),
-    voltage: round(ch0.voltage ?? ch1.voltage, 1),
-    temperature: round(ch0.temperature?.tC ?? ch1.temperature?.tC, 1),
-    rssi: status.wifi?.rssi,
-    errors: errors.join(', '),
-  };
+// Energiezähler des Shelly (Wh) in kWh.
+function kwh(counter) {
+  return round(counter?.total / 1000, 3);
 }
 
-// Nur geänderte Werte senden (schont den Bus).
+// Fehlerliste einer Komponente, z. B. ["overtemp"] → ["K1: overtemp"].
+function errorList(list, prefix) {
+  return (list ?? []).map(e => (prefix ? `${prefix}: ${e}` : e));
+}
+
+// Nur geänderte Werte senden (schont den Bus). undefined/null lässt den Ausgang unverändert.
 function onlyChanged(values) {
   const last = (node.state.last ??= {});
   const out = {};
@@ -154,20 +146,45 @@ function onlyChanged(values) {
   return out;
 }
 
+const CHANNELS = 4;
+const RELAYS = [relay1, relay2, relay3, relay4];
+
+async function main() {
+  if (node.trigger === 'request') node.respond('ok');
+  if (node.trigger === 'input') {
+    for (let i = 0; i < CHANNELS; i++) {
+      if (node.changed.includes(`relay${i + 1}`)) await rpc('Switch.Set', { id: i, on: RELAYS[i] });
+    }
+  }
+  const status = await rpc('Shelly.GetStatus');
+  const values = { online: true };
+  const errors = [];
+  for (let i = 0; i < CHANNELS; i++) {
+    const c = status[`switch:${i}`];
+    if (!c) throw new Error(`Keine Komponente switch:${i} – passt das Skript zum Gerät bzw. Profil?`);
+    const n = i + 1;
+    values[`on${n}`] = c.output;
+    values[`power${n}`] = round(c.apower, 1);
+    values[`current${n}`] = round(c.current, 2);
+    values[`energy${n}`] = kwh(c.aenergy);
+    errors.push(...errorList(c.errors, CHANNELS > 1 ? `K${n}` : ''));
+  }
+  const first = status['switch:0'];
+  values.voltage = round(first.voltage, 1);
+  values.temperature = round(first.temperature?.tC, 1);
+  values.rssi = status.wifi?.rssi;
+  values.errors = errors.join(', ');
+  return onlyChanged(values);
+}
+
 // ---------------------------------------------------------------------------
 // Ablauf
 // ---------------------------------------------------------------------------
 
-if (node.trigger === 'startup') node.every(POLL_MS, 'poll');
-if (node.trigger === 'request') node.respond('ok');
+if (node.trigger === 'startup') node.every(Math.max(1000, pollInterval), 'poll');
 
 try {
-  if (node.trigger === 'input') {
-    if (node.changed.includes('relay1')) await rpc('Switch.Set', { id: 0, on: relay1 });
-    if (node.changed.includes('relay2')) await rpc('Switch.Set', { id: 1, on: relay2 });
-  }
-  const status = await rpc('Shelly.GetStatus');
-  return onlyChanged(mapStatus(status));
+  return await main();
 } catch (e) {
   if (!e.offline) throw e;                  // Auth-/RPC-Fehler → Ausgang "Fehler"
   if (node.state.last?.online !== false) console.warn(e.message);
